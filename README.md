@@ -1,1 +1,1 @@
-Recursive pattern search in files
+# Recursive pattern search in files
