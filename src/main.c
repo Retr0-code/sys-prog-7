@@ -5,164 +5,66 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <getopt.h>
 #include <unistd.h>
 #include <threads.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-typedef struct
-{
-    const char *pattern;
-    size_t pat_len;
-    int delta1[256];
-    int *delta2;
-} bm_search_t;
-
-typedef struct
-{
-    char *filename;
-    bm_search_t *bm;
-} thrd_search_args_t;
+#define MAX_THREADS 256
+#define MAX_FILENAME 256
+#define USAGE_FMT "Usage: %s -p <pattern> [-d <directory>, -i]\n"
 
 mtx_t print_mutex;
 
-// Case-insensitive char comparison helper
-static inline unsigned char to_lower_uc(unsigned char c)
-{
-    return (unsigned char)tolower(c);
-}
+typedef int (*case_function_t)(int x);
 
-// Preprocessing for delta1 table (bad character rule)
-void bm_preprocess_delta1(bm_search_t *bm)
-{
-    for (int i = 0; i < 256; ++i)
-        bm->delta1[i] = (int)bm->pat_len;
+int no_case_change(int x) { return x; }
 
-    for (size_t i = 0; i < bm->pat_len - 1; ++i)
-        bm->delta1[to_lower_uc((unsigned char)bm->pattern[i])] = (int)(bm->pat_len - 1 - i);
-}
-
-// Helper function for suffixes used in delta2 preprocessing
-static void suffixes(const char *pat, int *suff, size_t len)
+ssize_t naive_search(
+    const char *text,
+    size_t text_len,
+    const char *pattern,
+    size_t pat_len,
+    case_function_t callback)
 {
-    size_t f = 0;
-    size_t g = len - 1;
-    suff[len - 1] = len;
-    for (size_t i = len - 2; i >= 0; --i)
+    if (pat_len == 0 || text_len < pat_len)
+        return -1;
+
+    for (ssize_t i = 0; i <= text_len - pat_len; ++i)
     {
-        if (i > g && suff[i + len - 1 - f] < i - g)
-            suff[i] = suff[i + len - 1 - f];
+        ssize_t j = 0;
+        for (; j < pat_len; ++j)
+            if ((*callback)(text[i + j]) != (*callback)(pattern[j]))
+                break;
 
-        else
-        {
-            if (i < g)
-                g = i;
-
-            f = i;
-            while (g >= 0 && to_lower_uc((unsigned char)pat[g]) == to_lower_uc((unsigned char)pat[g + len - 1 - f]))
-                --g;
-
-            suff[i] = f - g;
-        }
-    }
-}
-
-void bm_preprocess_delta2(bm_search_t *bm)
-{
-    size_t len = bm->pat_len;
-    int *suff = malloc(len * sizeof(int));
-    if (!suff)
-    {
-        perror("malloc");
-        exit(-1);
-    }
-    suffixes(bm->pattern, suff, len);
-
-    for (size_t i = 0; i < len; ++i)
-        bm->delta2[i] = len;
-
-    size_t j = 0;
-    for (size_t i = len - 1; i >= 0; --i)
-        if (suff[i] == i + 1)
-            for (; j < len - 1 - i; ++j)
-                if (bm->delta2[j] == len)
-                    bm->delta2[j] = len - 1 - i;
-
-    for (size_t i = 0; i <= len - 2; ++i)
-        bm->delta2[len - 1 - suff[i]] = len - 1 - i;
-
-    free(suff);
-}
-
-bm_search_t *bm_init(const char *pattern)
-{
-    bm_search_t *bm = malloc(sizeof(bm_search_t));
-    if (!bm)
-    {
-        perror("malloc");
-        exit(-1);
-    }
-    bm->pattern = pattern;
-    bm->pat_len = strlen(pattern);
-    bm->delta2 = malloc(bm->pat_len * sizeof(int));
-    if (!bm->delta2)
-    {
-        perror("malloc");
-        free(bm);
-        exit(-1);
-    }
-    bm_preprocess_delta1(bm);
-    bm_preprocess_delta2(bm);
-    return bm;
-}
-
-void bm_free(bm_search_t *bm)
-{
-    if (bm)
-    {
-        free(bm->delta2);
-        free(bm);
-    }
-}
-
-ssize_t bm_search(bm_search_t *bm, const char *text, size_t text_len)
-{
-    ssize_t i = 0;
-    while (i <= text_len - bm->pat_len)
-    {
-        ssize_t j = bm->pat_len - 1;
-        while (j >= 0 && to_lower_uc((unsigned char)bm->pattern[j]) == to_lower_uc((unsigned char)text[i + j]))
-            --j;
-
-        if (j < 0)
+        if (j == pat_len)
             return i;
-
-        else
-        {
-            int bc_shift = bm->delta1[(unsigned char)to_lower_uc((unsigned char)text[i + j])] - ((int)bm->pat_len - 1 - j);
-            int gs_shift = bm->delta2[j];
-            int shift = bc_shift > gs_shift ? bc_shift : gs_shift;
-
-            if (shift < 1)
-                shift = 1;
-
-            i += shift;
-        }
     }
     return -1;
 }
 
+typedef struct
+{
+    char *filename;
+    const char *pattern;
+    size_t pat_len;
+    case_function_t case_func;
+} thrd_search_args_t;
+
 int thread_search(thrd_search_args_t *targ)
 {
     const char *filename = targ->filename;
-    bm_search_t *bm = targ->bm;
+    const char *pattern = targ->pattern;
+    size_t pat_len = targ->pat_len;
+    case_function_t case_func = targ->case_func;
 
     int fd = open(filename, O_RDONLY);
     if (fd < 0)
     {
         free(targ->filename);
         free(targ);
-        return 0;
+        return -1;
     }
 
     struct stat st;
@@ -171,33 +73,32 @@ int thread_search(thrd_search_args_t *targ)
         close(fd);
         free(targ->filename);
         free(targ);
-        return 0;
+        return -1;
     }
 
-    size_t filesize = st.st_size;
+    size_t filesize = (size_t)st.st_size;
     char *data = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE, fd, 0);
     if (data == MAP_FAILED)
     {
         close(fd);
         free(targ->filename);
         free(targ);
-        return 0;
+        return -1;
     }
 
-    ssize_t offset = 0;
-    while (offset <= (filesize - bm->pat_len))
+    size_t offset = 0;
+    while (offset <= filesize - pat_len)
     {
-        ssize_t pos = bm_search(bm, data + offset, filesize - offset);
+        ssize_t pos = naive_search(data + offset, filesize - offset, pattern, pat_len, case_func);
         if (pos < 0)
             break;
 
-        // Lock mutex for printing
         mtx_lock(&print_mutex);
-        printf("%s:%zd\n", filename, offset + pos);
+        printf("%s:%zu\n", filename, offset + (size_t)pos);
         fflush(stdout);
         mtx_unlock(&print_mutex);
 
-        offset += pos + 1; // continue searching after the found position
+        offset += (size_t)pos + 1;
     }
 
     munmap(data, filesize);
@@ -207,8 +108,7 @@ int thread_search(thrd_search_args_t *targ)
     return 0;
 }
 
-// Recursively find files in directory and spawn threads for searching
-void search_directory(const char *dirpath, bm_search_t *bm)
+void search_directory(const char *dirpath, const char *pattern, size_t pat_len, case_function_t case_func)
 {
     DIR *dir = opendir(dirpath);
     if (!dir)
@@ -218,17 +118,18 @@ void search_directory(const char *dirpath, bm_search_t *bm)
     }
 
     struct dirent *entry;
-    thrd_t threads[256];
+    thrd_t threads[MAX_THREADS];
     int thread_count = 0;
+
     while ((entry = readdir(dir)) != NULL)
     {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
 
-        char *path = NULL;
-        if (asprintf(&path, "%s/%s", dirpath, entry->d_name) < 0)
+        char *path = malloc(MAX_FILENAME + 1 + strlen(dirpath));
+        if (sprintf(path, "%s/%s", dirpath, entry->d_name) < 0)
         {
-            perror("asprintf");
+            perror("sprintf");
             continue;
         }
 
@@ -241,13 +142,11 @@ void search_directory(const char *dirpath, bm_search_t *bm)
 
         if (S_ISDIR(st.st_mode))
         {
-            // Recurse into subdirectory
-            search_directory(path, bm);
+            search_directory(path, pattern, pat_len, case_func);
             free(path);
         }
         else if (S_ISREG(st.st_mode))
         {
-            // Spawn thread for regular file
             thrd_search_args_t *targ = malloc(sizeof(thrd_search_args_t));
             if (!targ)
             {
@@ -256,7 +155,9 @@ void search_directory(const char *dirpath, bm_search_t *bm)
                 continue;
             }
             targ->filename = path;
-            targ->bm = bm;
+            targ->pattern = pattern;
+            targ->pat_len = pat_len;
+            targ->case_func = case_func;
 
             if (thrd_create(&threads[thread_count], thread_search, targ) != thrd_success)
             {
@@ -267,8 +168,7 @@ void search_directory(const char *dirpath, bm_search_t *bm)
             }
             ++thread_count;
 
-            // Join threads if too many
-            if (thread_count == 256)
+            if (thread_count == MAX_THREADS)
             {
                 for (int i = 0; i < thread_count; ++i)
                     thrd_join(threads[i], NULL);
@@ -281,17 +181,59 @@ void search_directory(const char *dirpath, bm_search_t *bm)
     }
     closedir(dir);
 
-    for (int i = 0; i < thread_count; i++)
+    for (int i = 0; i < thread_count; ++i)
         thrd_join(threads[i], NULL);
 }
 
-int main(int argc, char *argv[])
+int main(int argc, char **argv)
 {
-    if (argc != 3)
+    const char *optstring = "p:d:i";
+    int option = 0;
+    char *dirpath = NULL;
+    char *pattern = NULL;
+    int case_insensetive = 0;
+    size_t pat_len = 0;
+    while ((option = getopt(argc, argv, optstring)) != -1)
     {
-        fprintf(stderr, "Usage: %s <directory> <pattern>\n", argv[0]);
-        return -1;
+        switch (option)
+        {
+            case 'p':
+                if (!optarg)
+                {
+                    fprintf(stderr, USAGE_FMT, argv[0]);
+                    return -1;
+                }
+
+                pat_len = strlen(optarg);
+                pattern = malloc(pat_len + 1);
+                strncpy(pattern, optarg, pat_len + 1);
+                break;
+
+            case 'd':
+                if (!optarg)
+                {
+                    fprintf(stderr, "Using default path ~/files");
+                    break;
+                }
+
+                size_t dir_len = strlen(optarg) + 1;
+                dirpath = malloc(dir_len);
+                strncpy(dirpath, optarg, dir_len);
+                break;
+
+            case 'i':
+                case_insensetive = 1;
+                break;
+
+            default:
+                fprintf(stderr, USAGE_FMT, argv[0]);
+                return -1;
+        }
     }
+
+    case_function_t search_func = &no_case_change;
+    if (case_insensetive)
+        search_func = tolower;
 
     if (mtx_init(&print_mutex, mtx_plain) != thrd_success)
     {
@@ -299,10 +241,10 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    bm_search_t *bm = bm_init(argv[2]);
-    search_directory(argv[1], bm);
-    bm_free(bm);
+    search_directory(dirpath, pattern, pat_len, search_func);
 
+    free(dirpath);
+    free(pattern);
     mtx_destroy(&print_mutex);
     return 0;
 }
