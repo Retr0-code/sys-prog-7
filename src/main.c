@@ -147,6 +147,7 @@ int thread_search(thrd_search_args_t *targ)
     free(targ);
     return 0;
 }
+
 /**
  * @brief Performs recursive search of pattern in specified directory.
  * 
@@ -263,6 +264,12 @@ void search_directory(
 
 int main(int argc, char **argv)
 {
+    if (argc < 2)
+    {
+        fprintf(stderr, USAGE_FMT, argv[0]);
+        return -1;
+    }
+
     // Initialization and parsing of parameters
     const char *optstring = "p:d:ir:";
     int option = 0;
@@ -290,7 +297,7 @@ int main(int argc, char **argv)
         case 'd':
             if (!optarg)
             {
-                fprintf(stderr, "Using default path ~/files");
+                fprintf(stderr, "Using default path ~/files\n");
                 break;
             }
 
